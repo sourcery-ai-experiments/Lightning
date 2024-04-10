@@ -14,7 +14,6 @@ GNU Affero General Public License for more details.
 You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
-
 from __future__ import annotations
 
 import contextlib
@@ -34,7 +33,8 @@ from lightning.cogs.automod import ui
 from lightning.cogs.automod.converters import (AutoModDuration,
                                                AutoModDurationResponse,
                                                IgnorableEntities)
-from lightning.cogs.automod.models import AutomodConfig, SpamConfig
+from lightning.cogs.automod.models import (AutomodConfig, GateKeeperConfig,
+                                           SpamConfig)
 from lightning.constants import (AUTOMOD_ADVANCED_EVENT_NAMES_MAPPING,
                                  AUTOMOD_ALL_EVENT_NAMES_LITERAL,
                                  AUTOMOD_BASIC_EVENT_NAMES_MAPPING,
@@ -66,12 +66,47 @@ class AutoMod(LightningCog, required=["Moderation"]):
     """Auto-moderation commands"""
     def __init__(self, bot: LightningBot):
         super().__init__(bot)
+        self.gatekeepers: dict[int, GateKeeperConfig] = {}
+        self.bot.loop.create_task(self.load_all_gatekeepers())
+        self.bot.add_dynamic_items(ui.GatekeeperVerificationButton)
         # AutoMod stats?
+
+    async def get_gatekeeper_config(self, guild_id: int) -> Optional[GateKeeperConfig]:
+        if guild_id in self.gatekeepers:
+            return self.gatekeepers[guild_id]
+
+        query = "SELECT * FROM guild_gatekeeper_config WHERE guild_id=$1;"
+        record = await self.bot.pool.fetchrow(query, guild_id)
+        if not record:
+            return
+
+        query = "SELECT * FROM pending_gatekeeper_members WHERE guild_id=$1;"
+        mems = await self.bot.pool.fetch(query, guild_id)
+        self.gatekeepers[guild_id] = gatekeeper = GateKeeperConfig(self.bot, record, mems)
+        return gatekeeper
+
+    def invalidate_gatekeeper(self, guild_id: int):
+        gtkp = self.gatekeepers.pop(guild_id, None)
+        if gtkp:
+            gtkp.gtkp_loop.cancel()
 
     async def cog_check(self, ctx: LightningContext) -> bool:
         if ctx.guild is None:
             raise commands.NoPrivateMessage()
         return True
+
+    async def load_all_gatekeepers(self):
+        await self.bot.wait_until_ready()
+
+        async with self.bot.pool.acquire() as conn:
+            records = await conn.fetch("SELECT * FROM guild_gatekeeper_config")
+            for record in records:
+                guilds = (g.id for g in self.bot.guilds)
+                if record['guild_id'] not in guilds:
+                    continue
+                members = await conn.fetch("SELECT * FROM pending_gatekeeper_members WHERE guild_id=$1",
+                                           record['guild_id'])
+                self.gatekeepers[record['guild_id']] = GateKeeperConfig(self.bot, record, members)
 
     @hybrid_group(level=CommandLevel.Admin)
     @app_commands.guild_only()
@@ -114,6 +149,10 @@ class AutoMod(LightningCog, required=["Moderation"]):
             embed.add_field(name="Warn Threshold",
                             value=f"Limit: {threshold}+\nPunishment: {config['warn_punishment']}",
                             inline=False)
+
+        if len(embed.fields) == 0:
+            await ctx.send("This server has not set up Lightning AutoMod yet!")
+            return
 
         await ctx.send(embed=embed)
 
@@ -319,7 +358,7 @@ class AutoMod(LightningCog, required=["Moderation"]):
             return
 
         if record.warn_ban and record.warn_kick:
-            view = ui.AutoModWarnThresholdMigration(context=ctx)
+            view = ui.AutoModWarnThresholdMigration(author_id=ctx.author.id)
             await ctx.send("Which would you like to migrate?\n\n> *Warn thresholds only support one threshold!*",
                            view=view)
             await view.wait()
@@ -359,6 +398,26 @@ class AutoMod(LightningCog, required=["Moderation"]):
 
         await ctx.send("Removed warn threshold!")
         await self.get_automod_config.invalidate(ctx.guild.id)
+
+    async def create_automod_config(self, guild: discord.Guild):
+        query = """INSERT INTO guild_automod_config (guild_id)
+                   VALUES ($1)
+                   ON CONFLICT (guild_id)
+                   DO NOTHING;"""
+        await self.bot.pool.execute(query, guild.id)
+
+    @automod.command(level=CommandLevel.Admin, name="gatekeeper")
+    @is_server_manager()
+    @commands.bot_has_guild_permissions(manage_channels=True, manage_roles=True)
+    async def gatekeeper_setup(self, ctx: GuildContext):
+        """Manages the gatekeeper"""
+        gatekeeper = await self.get_gatekeeper_config(ctx.guild.id)
+
+        if gatekeeper is None:
+            await self.create_automod_config(ctx.guild)
+
+        view = ui.GatekeeperSetup(gatekeeper, context=ctx)  # type: ignore
+        await view.start()
 
     @cache.cached('guild_automod', cache.Strategy.raw)
     async def get_automod_config(self, guild_id: int) -> Optional[AutomodConfig]:
@@ -631,6 +690,10 @@ class AutoMod(LightningCog, required=["Moderation"]):
 
     @LightningCog.listener()
     async def on_member_join(self, member: discord.Member):
+        gatekeeper = await self.get_gatekeeper_config(member.guild.id)
+        if gatekeeper and gatekeeper.active:
+            await gatekeeper.gatekeep_member(member)
+
         record = await self.get_automod_config(member.guild.id)
         if not record:
             return
@@ -692,3 +755,17 @@ class AutoMod(LightningCog, required=["Moderation"]):
             return
 
         await self.bot.api.bulk_upsert_guild_automod_default_ignores(payload.guild.id, config.default_ignores)
+
+    @LightningCog.listener('on_guild_role_delete')
+    async def on_gatekeeper_role_removal(self, role: discord.Role):
+        gatekeeper = await self.get_gatekeeper_config(role.guild.id)
+        if gatekeeper is None:
+            return
+
+        if gatekeeper.role_id != role.id:
+            return
+
+        query = "UPDATE guild_gatekeeper_config SET role_id=NULL, active='f' WHERE guild_id=$1;"
+        await self.bot.pool.execute(query, role.guild.id)
+        await gatekeeper.disable()
+        gatekeeper.role_id = None
